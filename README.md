@@ -4,7 +4,7 @@ Project Title: Molecular Simulation
 Project Type: Simulation
 This project introduces students to quantum chemistry through the lens of variational quantum algorithms, focusing on the simulation of diatomic molecules using the Variational Quantum Eigensolver (VQE)
 Mentor: Tarini
-Members: Bhavya Babbellapati, Maana Shahg10, Brinda Nallanichakravartula
+Members: Bhavya Babbellapati, Maana Shahg10, Brinda Nallanichakravartula grade 10
 
 Instructions on how to clone/run code or scripts:
 
