@@ -1,0 +1,261 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/bhavyab1234/quantum-project/blob/main/molecular_simulation_code\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "6tl-NaXw519I",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "48c86cf3-1fbc-41d1-d639-45eda602672b"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\u001b[2K   \u001b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m \u001b[32m50.9/50.9 MB\u001b[0m \u001b[31m16.3 MB/s\u001b[0m eta \u001b[36m0:00:00\u001b[0m\n",
+            "\u001b[?25h  Preparing metadata (setup.py) ... \u001b[?25l\u001b[?25hdone\n",
+            "\u001b[2K   \u001b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m \u001b[32m44.7/44.7 MB\u001b[0m \u001b[31m14.6 MB/s\u001b[0m eta \u001b[36m0:00:00\u001b[0m\n",
+            "\u001b[2K   \u001b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m \u001b[32m2.0/2.0 MB\u001b[0m \u001b[31m65.4 MB/s\u001b[0m eta \u001b[36m0:00:00\u001b[0m\n",
+            "\u001b[?25h  Building wheel for pubchempy (setup.py) ... \u001b[?25l\u001b[?25hdone\n",
+            "\u001b[2K   \u001b[90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\u001b[0m \u001b[32m969.6/969.6 kB\u001b[0m \u001b[31m35.7 MB/s\u001b[0m eta \u001b[36m0:00:00\u001b[0m\n",
+            "\u001b[?25h"
+          ]
+        }
+      ],
+      "source": [
+        "!pip install --quiet pyscf numpy scipy\n",
+        "!pip install --quiet openfermion openfermionpyscf\n",
+        "!pip install --quiet qulacs\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import numpy as np\n",
+        "from scipy.optimize import minimize\n",
+        "from pyscf import gto, scf\n",
+        "from openfermionpyscf import run_pyscf\n",
+        "from openfermion import MolecularData, FermionOperator, QubitOperator\n",
+        "from openfermion.transforms import jordan_wigner, get_fermion_operator\n",
+        "from qulacs import QuantumCircuit, QuantumState, Observable\n",
+        "from qulacs.gate import X, PauliRotation\n",
+        "\n",
+        "# ────────────── Helpers ──────────────\n",
+        "def parse_geom(geom: str):\n",
+        "    symbols, coords = [], []\n",
+        "    for token in geom.split(';'):\n",
+        "        a, x, y, z = token.strip().split()\n",
+        "        symbols.append(a)\n",
+        "        coords.append((float(x), float(y), float(z)))\n",
+        "    return symbols, coords\n",
+        "\n",
+        "def of_to_qulacs(q_op: QubitOperator, n_qubits: int) -> Observable:\n",
+        "    obs = Observable(n_qubits)\n",
+        "    for term, coeff in q_op.terms.items():\n",
+        "        if abs(coeff.imag) > 1e-8:\n",
+        "            continue\n",
+        "        if len(term) == 0:\n",
+        "            obs.add_operator(float(coeff.real), \"\")\n",
+        "        else:\n",
+        "            pauli_str = \" \".join(f\"{p} {i}\" for i, p in term)\n",
+        "            obs.add_operator(float(coeff.real), pauli_str)\n",
+        "    return obs\n",
+        "\n",
+        "def apply_hf_state(state: QuantumState, n_elec: int):\n",
+        "    n_qubits = state.get_qubit_count()\n",
+        "    for i in range(n_qubits - n_elec, n_qubits):\n",
+        "        X(i).update_quantum_state(state)\n",
+        "\n",
+        "def make_ansatz(term_sequence, n_qubits, n_elec):\n",
+        "    _pauli_map = {\"X\": 1, \"Y\": 2, \"Z\": 3}\n",
+        "    def circuit(theta):\n",
+        "        qc = QuantumCircuit(n_qubits)\n",
+        "        for i in range(n_qubits - n_elec, n_qubits):\n",
+        "            qc.add_gate(X(i))\n",
+        "        for k, label in enumerate(term_sequence):\n",
+        "            idxs, ids = [], []\n",
+        "            tokens = label.split()\n",
+        "            for p, q in zip(tokens[::2], tokens[1::2]):\n",
+        "                idxs.append(int(q))\n",
+        "                ids.append(_pauli_map[p])\n",
+        "            qc.add_gate(PauliRotation(idxs, ids, float(theta[k])))\n",
+        "        return qc\n",
+        "    return circuit\n",
+        "\n",
+        "def expectation(state: QuantumState, q_op: QubitOperator):\n",
+        "    obs = of_to_qulacs(q_op, state.get_qubit_count())\n",
+        "    return obs.get_expectation_value(state)\n",
+        "\n",
+        "def build_qubit_hamiltonian(geom: str, basis: str = \"sto-3g\"):\n",
+        "    symbols, coords = parse_geom(geom)\n",
+        "    geometry = [(s, tuple(c)) for s, c in zip(symbols, coords)]\n",
+        "    mol = MolecularData(geometry=geometry, basis=basis, multiplicity=1, charge=0)\n",
+        "    mol = run_pyscf(mol, run_scf=1, run_mp2=0, run_cisd=0, run_ccsd=0, run_fci=0)\n",
+        "    ferm_h = mol.get_molecular_hamiltonian()\n",
+        "    qubit_h = jordan_wigner(get_fermion_operator(ferm_h))\n",
+        "    return qubit_h, mol.n_qubits, mol.n_electrons, mol.hf_energy\n",
+        "\n",
+        "def build_physical_pool(n_qubits):\n",
+        "    ferm_ops = [\n",
+        "        FermionOperator(\"1^ 0\"),\n",
+        "        FermionOperator(\"3^ 2\"),\n",
+        "        FermionOperator(\"1^ 0 3^ 2\"),\n",
+        "        FermionOperator(\"2^ 0 3^ 1\"),\n",
+        "    ]\n",
+        "    pool = []\n",
+        "    for op in ferm_ops:\n",
+        "        jw_op = jordan_wigner(op)\n",
+        "        for label, coeff in jw_op.terms.items():\n",
+        "            if abs(coeff) > 1e-6 and len(label) > 0:\n",
+        "                pauli_str = \" \".join(f\"{p} {i}\" for i, p in label)\n",
+        "                pool.append((pauli_str, float(coeff.real)))\n",
+        "    return pool\n",
+        "\n",
+        "# ────────────── Adaptive VQE ──────────────\n",
+        "def adaptive_vqe_iterative(geom, basis=\"sto-3g\", grad_threshold=1e-4, energy_threshold=1e-6, max_cycles=20, maxiter_per_cycle=200, verbose=True):\n",
+        "    q_op, n_q, n_e, hf_E = build_qubit_hamiltonian(geom, basis)\n",
+        "    print(f\"[DEBUG] Qubits = {n_q}, Electrons = {n_e}\")\n",
+        "\n",
+        "    pool = build_physical_pool(n_q)\n",
+        "    selected, params = [], np.array([])\n",
+        "\n",
+        "    def energy(labels, theta):\n",
+        "        circ = make_ansatz(labels, n_q, n_e)(theta)\n",
+        "        st = QuantumState(n_q)\n",
+        "        circ.update_quantum_state(st)\n",
+        "        return expectation(st, q_op)\n",
+        "\n",
+        "    st = QuantumState(n_q)\n",
+        "    apply_hf_state(st, n_e)\n",
+        "    current_E = expectation(st, q_op)\n",
+        "\n",
+        "    if verbose:\n",
+        "        print(f\"Hartree–Fock energy (PySCF)   : {hf_E:.6f} Ha\")\n",
+        "        print(f\"Hartree–Fock energy (qulacs) : {current_E:.6f} Ha\")\n",
+        "\n",
+        "    for cyc in range(max_cycles):\n",
+        "        best_grad = 0.0\n",
+        "        best_lbl = None\n",
+        "        for lbl, _ in pool:\n",
+        "            if lbl in selected:\n",
+        "                continue\n",
+        "            trial_labels = selected + [lbl]\n",
+        "            test_energy = lambda shift: energy(trial_labels, np.append(params, shift))\n",
+        "            g = 0.5 * (test_energy(+np.pi/2) - test_energy(-np.pi/2))\n",
+        "            if abs(g) > best_grad:\n",
+        "                best_grad, best_lbl = abs(g), lbl\n",
+        "            if verbose:\n",
+        "                print(f\"  Testing {lbl:<20s} → E(+π/2) = {test_energy(+np.pi/2): .6f}, E(-π/2) = {test_energy(-np.pi/2): .6f}, |grad| = {abs(g):.2e}\")\n",
+        "\n",
+        "        if best_grad < grad_threshold:\n",
+        "            if verbose:\n",
+        "                print(\"No gradient > threshold — stopping.\")\n",
+        "            break\n",
+        "\n",
+        "        selected.append(best_lbl)\n",
+        "        init_params = np.append(params, 0.0)\n",
+        "        res = minimize(lambda th: energy(selected, th), init_params, method=\"COBYLA\", options={\"maxiter\": maxiter_per_cycle})\n",
+        "        params = res.x\n",
+        "        new_E = res.fun\n",
+        "        dE = abs(new_E - current_E)\n",
+        "        current_E = new_E\n",
+        "\n",
+        "        if verbose:\n",
+        "            print(f\"Cycle {cyc+1:2d}: added {best_lbl:<20s} E={current_E:.6f}  ΔE={dE:.2e}\")\n",
+        "\n",
+        "        if dE < energy_threshold:\n",
+        "            if verbose:\n",
+        "                print(f\"ΔE < {energy_threshold} → converged.\")\n",
+        "            break\n",
+        "\n",
+        "    final_circ = make_ansatz(selected, n_q, n_e)(params)\n",
+        "    depth = getattr(final_circ, \"get_gate_count\", lambda: len(final_circ.gate_list))()\n",
+        "    gates = depth - n_e\n",
+        "\n",
+        "    print(\"\\n=== Iterative Adaptive VQE Summary ===\")\n",
+        "    print(f\"Final VQE energy    : {current_E:.6f} Ha\")\n",
+        "    print(f\"Hartree–Fock energy : {hf_E:.6f} Ha   (Δ = {abs(hf_E - current_E):.6f} Ha)\")\n",
+        "    print(f\"Qubits used         : {n_q}\")\n",
+        "    print(f\"Gates used          : {gates}\")\n",
+        "    print(f\"Selected terms      : {len(selected)}\")\n",
+        "    print(f\"Circuit depth       : {depth}\")\n",
+        "    print(f\"\\n[RESULT] Final energy = {current_E:.6f} Ha\")\n",
+        "\n",
+        "# ────── Run ──────\n",
+        "if __name__ == \"__main__\":\n",
+        "    adaptive_vqe_iterative(\"H 0.0 0.0 0.0; F 0.0 0.0 0.91\"\n",
+        "    )\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 384
+        },
+        "id": "RLWhrfbj7GYT",
+        "outputId": "426fc1fa-4cdb-43ba-a461-983d9c4baddc"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "error",
+          "ename": "ModuleNotFoundError",
+          "evalue": "No module named 'pyscf'",
+          "traceback": [
+            "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+            "\u001b[0;31mModuleNotFoundError\u001b[0m                       Traceback (most recent call last)",
+            "\u001b[0;32m/tmp/ipython-input-1-12645323.py\u001b[0m in \u001b[0;36m<cell line: 0>\u001b[0;34m()\u001b[0m\n\u001b[1;32m      1\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mnumpy\u001b[0m \u001b[0;32mas\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m      2\u001b[0m \u001b[0;32mfrom\u001b[0m \u001b[0mscipy\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0moptimize\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mminimize\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m----> 3\u001b[0;31m \u001b[0;32mfrom\u001b[0m \u001b[0mpyscf\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mgto\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mscf\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m      4\u001b[0m \u001b[0;32mfrom\u001b[0m \u001b[0mopenfermionpyscf\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mrun_pyscf\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m      5\u001b[0m \u001b[0;32mfrom\u001b[0m \u001b[0mopenfermion\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mMolecularData\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mFermionOperator\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mQubitOperator\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+            "\u001b[0;31mModuleNotFoundError\u001b[0m: No module named 'pyscf'",
+            "",
+            "\u001b[0;31m---------------------------------------------------------------------------\u001b[0;32m\nNOTE: If your import is failing due to a missing package, you can\nmanually install dependencies using either !pip or !apt.\n\nTo view examples of installing some common dependencies, click the\n\"Open Examples\" button below.\n\u001b[0;31m---------------------------------------------------------------------------\u001b[0m\n"
+          ],
+          "errorDetails": {
+            "actions": [
+              {
+                "action": "open_url",
+                "actionText": "Open Examples",
+                "url": "/notebooks/snippets/importing_libraries.ipynb"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [],
+      "metadata": {
+        "id": "czSkJIW4Ay0u"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
